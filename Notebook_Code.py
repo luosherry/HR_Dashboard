@@ -12,7 +12,7 @@ spark2 = SparkSession.builder.getOrCreate()
 
 df_azure = spark.sql("SELECT * FROM Lakehouse_HR_PROD.rawmyGCHR")
 
-# Clean Column Names
+# Clean Column Names by cleaning and standardizing the column names of a DataFrame (df_azure) by removing or replacing certain characters.
 columns = df_azure.columns
 def clean_column_name(column_name):
     return column_name.strip().replace(" ", "_").replace(";", "").replace("{", "").replace("}", "").replace("(", "").replace(")", "").replace("\n", "").replace("\t", "").replace("=", "")
@@ -25,6 +25,8 @@ for col in columns:
 #                             #
 ###############################
 
+# Cleaning code creates indicators (Sunset, Substantive_Old, Substantive, Secondment) based on various conditions. Finally, it adjusts the date format for the "Eff_Date" column.
+# converting data type to a date format.
 df_azure = df_azure.withColumn("Eff_Date", F.to_date(F.col("Eff_Date"), "M/d/yyyy"))
 
 refSunsetIndicator = df_azure.filter(F.col("Reason_Descr") == "Sunset Program").groupBy("PSSI_Position", "ID").agg(F.min("Eff_Date").alias("SunsetDate"))
@@ -55,6 +57,7 @@ df_azure = df_azure_joined.withColumn("Eff_Date", F.to_date(F.col("Eff_Date"), "
 #                            #
 ##############################
 
+# hard coded start and end dates that encompass the time period that PSSI is place
 start_date = datetime(2021, 1, 1).date()
 end_date = datetime(2027, 12, 31).date()
 num_days = (end_date - start_date).days
@@ -62,19 +65,20 @@ num_days = (end_date - start_date).days
 # Generate a DataFrame of calendar dates from the start_date to end_date
 date_df_azure = spark2.range(num_days + 1).select(F.date_add(F.lit(start_date), F.col("id").cast("int")).alias("Calendar_Date"))
 
-# Window specification to find the next `Eff Date`
+# Window specification to find the next `Eff Date` Window Specifications: Two window specifications are defined: One to sort and partition data by "ID" and "Empl_Record", ordered by "Eff_Date".
+# Another to handle multiple entries for the same effective date, ensuring that only the entry with the maximum sequence is kept.
 windowSpec_azure = Window.partitionBy("ID", "Empl_Record").orderBy("Eff_Date")
 
 # Resolve the multiple Eff Date entries with Window to keep max Sequence
 windowSpec2_azure = Window.partitionBy("ID", "Empl_Record", "Eff_date").orderBy(F.col("Sequence").desc())
 
+# The DataFrame is processed to remove any duplicate entries based on the effective date, keeping only the one with the highest sequence value.
 df_azure = df_azure.withColumn("row_num", F.row_number().over(windowSpec2_azure)).filter(F.col("row_num") == 1).drop("row_num")
-
 
 # Find the next `Eff Date` for each `ID` and `Empl Record`
 df_azure = df_azure.withColumn("Next_Eff_Date", F.lead("Eff_Date").over(windowSpec_azure))
 
-# Cross join with the date DataFrame to duplicate rows
+# Cross join with the date DataFrame to duplicate rows. This operation duplicates rows for each date between the effective date and the next effective date (or the last available date if no next effective date exists).
 df_azure = df_azure.crossJoin(date_df_azure).filter((F.col("Calendar_Date") >= F.col("Eff_Date")) & ((F.col("Calendar_Date") < F.col("Next_Eff_Date")) | (F.col("Next_Eff_Date").isNull())))
 
 # Create Substantive Indicator (T/F)
@@ -93,7 +97,7 @@ df_azure = df_azure.withColumn("Secondment_Indicator", F.max("Secondment").over(
 empl_class_conditions = ["Greater than 6 months", "=or> 3 months =or< 6 months", "Less than 3 months"]
 acting_class_conditions = ["Acting Appointment < 4 months", "Acting Appointment =or> 4 mths"]
 
-#retired (not used anymore)
+# retired (not used anymore) defining the employment class of each employee
 df_azure = df_azure.withColumn("Empl_Class_Category_Row",
     F.when((F.col("Empl_Class_Desc").isin(empl_class_conditions)) & (F.col("Sunset") == "T"), "Sunset Term")
     .when((F.col("Empl_Class_Desc").isin(empl_class_conditions)) & (F.col("Sunset") == "F"), "Term")
@@ -102,7 +106,7 @@ df_azure = df_azure.withColumn("Empl_Class_Category_Row",
     .otherwise("Other")
 )
 
-
+# similar to the above conditions, with the inclusion of the use of the substantive_indicator and the secondment_indicator
 df_azure = df_azure.withColumn(
     "Empl_Class_Category_Substantive_OLD",
     # Sub in pssi vs not in pssi
@@ -117,9 +121,7 @@ df_azure = df_azure.withColumn(
     .otherwise("Other")
 )
 
-
-
-
+# similar to the above conditions, but with the addition of a flag that also flags an indeterminate that is acting/assignment/secondment
 # Sub in pssi vs not in pssi
     # if not the you are always acting
     # else rules \/ 
@@ -159,6 +161,7 @@ df_azure = df_azure.withColumn("Empl_Class_Category_PSSI_Substantive",
 # Add in end date, and duration
 #df_azure = df_azure.withColumn("End_date", F.when())
 
+# indicator to classify sunset term, term, and indeterminates
 df_azure = df_azure.withColumn("Empl_Class_Category_Non_Substantive",F.when((F.col("Empl_Class_Desc").isin(empl_class_conditions)) & (F.col("Sunset") == "T"), "Sunset Term").when((F.col("Empl_Class_Desc").isin(empl_class_conditions)) & (F.col("Sunset") == "F"), "Term").when((F.col("Empl_Class_Desc") == "Indeterminate") & (F.col("Substantive_Indicator") == 1), "Indeterminate").otherwise("Other"))
 
 af_azure = df_azure.withColumn("Position", df_azure["Position"].cast("string"))
@@ -168,11 +171,9 @@ af_azure = df_azure.withColumn("Position", df_azure["Position"].cast("string"))
 #df_azure1 = df_azure.withColumn("new_column", df_azure["Position"])
 
 # Latest Pull Date Indicator
-
 df_azure = df_azure.withColumn("LatestPullIndicator", F.when((F.col("DataUpdateDate") == F.col("Calendar_Date")), "T").otherwise("F"))
 
 # Added CurrentPSSIActive Indicator
-
 df_azure = df_azure.withColumn("CurrentPSSIActive", F.when((F.col("PSSI_Position") == "Y") & (F.col("Pay_Status") == "Active") & (F.col("LatestPullIndicator") == "T"), "T").otherwise("F"))
 
 
@@ -210,14 +211,14 @@ from pyspark.sql.types import IntegerType
 spark2 = SparkSession.builder.getOrCreate()
 gchr_raw = spark2.sql("SELECT * FROM Lakehouse_HR_PROD.rawmyGCHR") 
 
-#remove invalid characters from column names
+# remove invalid characters from column names
 columns = gchr_raw.columns
 def clean_column_name(column_name):
     return column_name.strip().replace(" ", "_").replace(";", "").replace("{", "").replace("}", "").replace("(", "").replace(")", "").replace("\n", "").replace("\t", "").replace("=", "")
 for col in columns:
     gchr_raw = gchr_raw.withColumnRenamed(col, clean_column_name(col))
 
-#format 'Eff_Date' column
+# format 'Eff_Date' column
 gchr_raw = gchr_raw.withColumn("Eff_Date", F.to_date(F.col("Eff_Date"), "M/d/yyyy"))
 #check if data has been updated
 #gchr_raw.show(1)
